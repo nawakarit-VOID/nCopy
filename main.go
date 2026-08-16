@@ -55,6 +55,29 @@ func (j jobStatus) String() string {
 	return ""
 }
 
+type overwritePolicy int
+
+const (
+	overwriteAlways overwritePolicy = iota
+	overwriteAsk
+	overwriteSkip
+	overwriteRename
+)
+
+func (o overwritePolicy) String() string {
+	switch o {
+	case overwriteAlways:
+		return "เขียนทับเสมอ (Overwrite)"
+	case overwriteAsk:
+		return "ถามก่อนเขียนทับ (Ask)"
+	case overwriteSkip:
+		return "ข้ามเมื่อเจอไฟล์ซ้ำ (Skip)"
+	case overwriteRename:
+		return "เปลี่ยนชื่ออัตโนมัติ (Rename)"
+	}
+	return ""
+}
+
 // ---------- ตัวควบคุมการทำงาน (pause/resume/cancel) ----------
 
 type controller struct {
@@ -117,6 +140,7 @@ type app_ struct {
 
 	sources []string // ไฟล์/โฟลเดอร์ต้นฉบับที่ผู้ใช้เลือก
 	destDir string
+	policy  overwritePolicy
 
 	jobs []*copyJob
 
@@ -193,7 +217,7 @@ func (a *app_) buildUI() fyne.CanvasObject {
 
 	sourceButtons := container.NewHBox(btnAddFiles, btnAddFolder, btnClear)
 
-	// --- ส่วนเลือกปลายทาง ---
+	// --- ส่วนเลือกปลายทาง & ตัวเลือกไฟล์ซ้ำ ---
 	a.destLabel = widget.NewLabel("(ยังไม่ได้เลือกโฟลเดอร์ปลายทาง)")
 	btnDest := widget.NewButtonWithIcon("เลือกปลายทาง...", nil, func() {
 		fd := dialog.NewFolderOpen(func(u fyne.ListableURI, err error) {
@@ -206,6 +230,29 @@ func (a *app_) buildUI() fyne.CanvasObject {
 		fd.Show()
 	})
 	destRow := container.NewBorder(nil, nil, nil, btnDest, a.destLabel)
+
+	policySelect := widget.NewSelect([]string{
+		overwriteAlways.String(),
+		overwriteAsk.String(),
+		overwriteSkip.String(),
+		overwriteRename.String(),
+	}, func(selected string) {
+		switch selected {
+		case overwriteAlways.String():
+			a.policy = overwriteAlways
+		case overwriteAsk.String():
+			a.policy = overwriteAsk
+		case overwriteSkip.String():
+			a.policy = overwriteSkip
+		case overwriteRename.String():
+			a.policy = overwriteRename
+		}
+	})
+	policySelect.SetSelected(overwriteAlways.String())
+	policyRow := container.NewHBox(
+		widget.NewLabelWithStyle("กรณีพบไฟล์ซ้ำ:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		policySelect,
+	)
 
 	// --- รายการคิวไฟล์ ---
 	a.fileList = widget.NewList(
@@ -257,6 +304,7 @@ func (a *app_) buildUI() fyne.CanvasObject {
 		widget.NewSeparator(),
 		widget.NewLabelWithStyle("ปลายทาง", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		destRow,
+		policyRow,
 		widget.NewSeparator(),
 		widget.NewLabelWithStyle("คิวไฟล์ (เรียงตามตัวอักษร)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 	)
@@ -406,8 +454,15 @@ func (a *app_) runCopy() {
 			continue
 		}
 
+		finalDstPath, action := a.resolveDestination(destPath, j.RelPath)
+		if action == "skip" {
+			j.Status = statusSkipped
+			a.safeRefreshFileList()
+			continue
+		}
+
 		start := time.Now()
-		copiedInFile, err := a.copyOneFile(j.SrcPath, destPath, j.Size, func(copied int64) {
+		copiedInFile, err := a.copyOneFile(j.SrcPath, finalDstPath, j.Size, func(copied int64) {
 			if j.Size > 0 {
 				val := float64(copied) / float64(j.Size)
 				fyne.Do(func() {
@@ -506,6 +561,58 @@ func (a *app_) copyOneFile(src, dst string, size int64, onProgress func(copied i
 		}
 	}
 	return copied, nil
+}
+
+// resolveDestination ตรวจสอบไฟล์ซ้ำตามนโยบาย (policy) ที่เลือก
+// คืนค่า (path ปลายทางที่จะใช้, แอคชัน "copy" หรือ "skip")
+func (a *app_) resolveDestination(destPath, relPath string) (string, string) {
+	if _, err := os.Stat(destPath); os.IsNotExist(err) {
+		return destPath, "copy"
+	}
+
+	switch a.policy {
+	case overwriteAlways:
+		return destPath, "copy"
+
+	case overwriteSkip:
+		return destPath, "skip"
+
+	case overwriteRename:
+		ext := filepath.Ext(destPath)
+		base := strings.TrimSuffix(destPath, ext)
+		counter := 1
+		for {
+			newName := fmt.Sprintf("%s (%d)%s", base, counter, ext)
+			if _, err := os.Stat(newName); os.IsNotExist(err) {
+				return newName, "copy"
+			}
+			counter++
+		}
+
+	case overwriteAsk:
+		ch := make(chan string)
+		fyne.Do(func() {
+			d := dialog.NewConfirm(
+				"พบไฟล์ซ้ำ",
+				fmt.Sprintf("ไฟล์ปลายทาง %s มีอยู่แล้ว\nคุณต้องการเขียนทับหรือไม่?", relPath),
+				func(overwrite bool) {
+					if overwrite {
+						ch <- "copy"
+					} else {
+						ch <- "skip"
+					}
+				},
+				a.win,
+			)
+			d.SetConfirmText("เขียนทับ (Overwrite)")
+			d.SetDismissText("ข้ามไฟล์นี้ (Skip)")
+			d.Show()
+		})
+		action := <-ch
+		return destPath, action
+	}
+
+	return destPath, "copy"
 }
 
 // safeRefreshFileList รีเฟรช list widget (เรียกจาก goroutine พื้นหลัง)
