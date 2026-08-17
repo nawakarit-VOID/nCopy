@@ -533,6 +533,12 @@ func (a *app_) copyOneFile(src, dst string, size int64, onProgress func(copied i
 	}
 	defer out.Close()
 
+	srcInfo, err := in.Stat()
+	if err == nil {
+		// คัดลอก Permissions (Chmod)
+		_ = out.Chmod(srcInfo.Mode())
+	}
+
 	buf := make([]byte, copyBufSize)
 	var copied int64
 	for {
@@ -560,6 +566,13 @@ func (a *app_) copyOneFile(src, dst string, size int64, onProgress func(copied i
 			return copied, rerr
 		}
 	}
+
+	// คัดลอกเวลาแก้ไขล่าสุด (Modification Time / Access Time)
+	if srcInfo != nil {
+		_ = out.Close() // ปิดไฟล์ก่อนตั้งเวลา
+		_ = os.Chtimes(dst, srcInfo.ModTime(), srcInfo.ModTime())
+	}
+
 	return copied, nil
 }
 
