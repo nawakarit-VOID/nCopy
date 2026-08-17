@@ -461,7 +461,9 @@ func (a *app_) runCopy() {
 			continue
 		}
 
-		start := time.Now()
+		lastTime := time.Now()
+		lastCopied := int64(0)
+
 		copiedInFile, err := a.copyOneFile(j.SrcPath, finalDstPath, j.Size, func(copied int64) {
 			if j.Size > 0 {
 				val := float64(copied) / float64(j.Size)
@@ -469,13 +471,18 @@ func (a *app_) runCopy() {
 					a.fileProgress.SetValue(val)
 				})
 			}
-			elapsed := time.Since(start).Seconds()
-			if elapsed > 0.2 {
-				speed := float64(copied) / elapsed
+
+			now := time.Now()
+			elapsed := now.Sub(lastTime).Seconds()
+			if elapsed >= 0.5 { // คำนวณและอัปเดตความเร็วทุกๆ 0.5 วินาที
+				bytesDiff := copied - lastCopied
+				speed := float64(bytesDiff) / elapsed
 				speedStr := fmt.Sprintf("ความเร็ว: %s/วินาที", humanSize(int64(speed)))
 				fyne.Do(func() {
 					a.speedLabel.SetText(speedStr)
 				})
+				lastTime = now
+				lastCopied = copied
 			}
 			a.updateOverall(doneCount, len(a.jobs), doneBytes+copied, totalBytes)
 		})
