@@ -542,16 +542,17 @@ func (a *app_) copyOneFile(src, dst string, size int64, onProgress func(copied i
 	buf := make([]byte, copyBufSize)
 	var copied int64
 	for {
-		if a.ctrl.waitIfPaused() {
-			return copied, errCancelled
-		}
-		if a.ctrl.isCancelled() {
+		if a.ctrl.waitIfPaused() || a.ctrl.isCancelled() {
+			out.Close()
+			os.Remove(dst) // ลบไฟล์ค้างที่ไม่สมบูรณ์เมื่อถูกยกเลิก
 			return copied, errCancelled
 		}
 
 		n, rerr := in.Read(buf)
 		if n > 0 {
 			if _, werr := out.Write(buf[:n]); werr != nil {
+				out.Close()
+				os.Remove(dst) // ลบไฟล์ที่ไม่สมบูรณ์กรณีเกิด Error ขณะเขียน
 				return copied, werr
 			}
 			copied += int64(n)
@@ -563,6 +564,8 @@ func (a *app_) copyOneFile(src, dst string, size int64, onProgress func(copied i
 			break
 		}
 		if rerr != nil {
+			out.Close()
+			os.Remove(dst) // ลบไฟล์ที่ไม่สมบูรณ์กรณีเกิด Error ขณะอ่าน
 			return copied, rerr
 		}
 	}
