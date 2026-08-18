@@ -167,6 +167,25 @@ func main() {
 	w.Resize(fyne.NewSize(720, 640))
 
 	ap := &app_{fyneApp: a, win: w, ctrl: newController()}
+
+	// รองรับ Drag & Drop ลากไฟล์/โฟลเดอร์มาวางในหน้าต่างโปรแกรม
+	w.SetOnDropped(func(pos fyne.Position, uris []fyne.URI) {
+		added := false
+		for _, u := range uris {
+			if u.Scheme() == "file" || u.Scheme() == "" {
+				path := u.Path()
+				if path != "" {
+					ap.sources = append(ap.sources, path)
+					added = true
+				}
+			}
+		}
+		if added {
+			ap.sourceList.Refresh()
+			ap.rebuildQueue()
+		}
+	})
+
 	w.SetContent(ap.buildUI())
 	w.ShowAndRun()
 }
