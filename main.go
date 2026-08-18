@@ -463,6 +463,7 @@ func (a *app_) runCopy() {
 
 		lastTime := time.Now()
 		lastCopied := int64(0)
+		var currentSpeed float64 // smoothed speed (EMA)
 
 		copiedInFile, err := a.copyOneFile(j.SrcPath, finalDstPath, j.Size, func(copied int64) {
 			if j.Size > 0 {
@@ -474,10 +475,33 @@ func (a *app_) runCopy() {
 
 			now := time.Now()
 			elapsed := now.Sub(lastTime).Seconds()
-			if elapsed >= 0.5 { // คำนวณและอัปเดตความเร็วทุกๆ 0.5 วินาที
+			if elapsed >= 0.4 { // อัปเดตทุก 0.4 วินาที
 				bytesDiff := copied - lastCopied
-				speed := float64(bytesDiff) / elapsed
-				speedStr := fmt.Sprintf("ความเร็ว: %s/วินาที", humanSize(int64(speed)))
+				instSpeed := float64(bytesDiff) / elapsed
+
+				// ใช้ Exponential Moving Average (EMA) เพื่อความนุ่มนวลและแม่นยำ
+				if currentSpeed == 0 {
+					currentSpeed = instSpeed
+				} else {
+					alpha := 0.3 // น้ำหนักของความเร็วปัจจุบัน
+					currentSpeed = alpha*instSpeed + (1-alpha)*currentSpeed
+				}
+
+				// คำนวณเวลาที่เหลือโดยประมาณ (ETA)
+				remBytes := totalBytes - (doneBytes + copied)
+				var etaStr string
+				if currentSpeed > 0 && remBytes > 0 {
+					remSec := int(float64(remBytes) / currentSpeed)
+					if remSec < 60 {
+						etaStr = fmt.Sprintf(" (เหลือ ~%d วินาที)", remSec)
+					} else if remSec < 3600 {
+						etaStr = fmt.Sprintf(" (เหลือ ~%d นาที %d วินาที)", remSec/60, remSec%60)
+					} else {
+						etaStr = fmt.Sprintf(" (เหลือ ~%d ชม. %d นาที)", remSec/3600, (remSec%3600)/60)
+					}
+				}
+
+				speedStr := fmt.Sprintf("ความเร็ว: %s/วินาที%s", humanSize(int64(currentSpeed)), etaStr)
 				fyne.Do(func() {
 					a.speedLabel.SetText(speedStr)
 				})
