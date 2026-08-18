@@ -3,7 +3,11 @@
 package main
 
 import (
+	"crypto/md5"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -26,9 +30,11 @@ type jobStatus int
 const (
 	statusWaiting jobStatus = iota
 	statusCopying
+	statusVerifying
 	statusDone
 	statusSkipped
 	statusError
+	statusVerifyFailed
 )
 
 type copyJob struct {
@@ -45,12 +51,16 @@ func (j jobStatus) String() string {
 		return "รอคิว"
 	case statusCopying:
 		return "กำลังคัดลอก"
+	case statusVerifying:
+		return "กำลังตรวจ Hash"
 	case statusDone:
 		return "เสร็จแล้ว"
 	case statusSkipped:
 		return "ข้าม"
 	case statusError:
 		return "ผิดพลาด"
+	case statusVerifyFailed:
+		return "Checksum ล้มเหลว!"
 	}
 	return ""
 }
@@ -74,6 +84,26 @@ func (o overwritePolicy) String() string {
 		return "ข้ามเมื่อเจอไฟล์ซ้ำ (Skip)"
 	case overwriteRename:
 		return "เปลี่ยนชื่ออัตโนมัติ (Rename)"
+	}
+	return ""
+}
+
+type verifyMode int
+
+const (
+	verifyNone verifyMode = iota
+	verifyMD5
+	verifySHA256
+)
+
+func (v verifyMode) String() string {
+	switch v {
+	case verifyNone:
+		return "ไม่ตรวจสอบ (None)"
+	case verifyMD5:
+		return "ตรวจสอบ MD5 Hash"
+	case verifySHA256:
+		return "ตรวจสอบ SHA256 Hash"
 	}
 	return ""
 }
@@ -141,6 +171,7 @@ type app_ struct {
 	sources []string // ไฟล์/โฟลเดอร์ต้นฉบับที่ผู้ใช้เลือก
 	destDir string
 	policy  overwritePolicy
+	verify  verifyMode
 
 	jobs []*copyJob
 
@@ -268,9 +299,28 @@ func (a *app_) buildUI() fyne.CanvasObject {
 		}
 	})
 	policySelect.SetSelected(overwriteAlways.String())
-	policyRow := container.NewHBox(
-		widget.NewLabelWithStyle("กรณีพบไฟล์ซ้ำ:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+
+	verifySelect := widget.NewSelect([]string{
+		verifyNone.String(),
+		verifyMD5.String(),
+		verifySHA256.String(),
+	}, func(selected string) {
+		switch selected {
+		case verifyNone.String():
+			a.verify = verifyNone
+		case verifyMD5.String():
+			a.verify = verifyMD5
+		case verifySHA256.String():
+			a.verify = verifySHA256
+		}
+	})
+	verifySelect.SetSelected(verifyNone.String())
+
+	optionsRow := container.NewHBox(
+		widget.NewLabelWithStyle("กรณีไฟล์ซ้ำ:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		policySelect,
+		widget.NewLabelWithStyle("  ตรวจสอบความถูกต้อง:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		verifySelect,
 	)
 
 	// --- รายการคิวไฟล์ ---
@@ -323,7 +373,7 @@ func (a *app_) buildUI() fyne.CanvasObject {
 		widget.NewSeparator(),
 		widget.NewLabelWithStyle("ปลายทาง", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		destRow,
-		policyRow,
+		optionsRow,
 		widget.NewSeparator(),
 		widget.NewLabelWithStyle("คิวไฟล์ (เรียงตามตัวอักษร)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 	)
@@ -538,9 +588,28 @@ func (a *app_) runCopy() {
 				j.Err = err
 			}
 		} else {
-			j.Status = statusDone
-			doneBytes += copiedInFile
-			doneCount++
+			// ตรวจสอบ Checksum / Hash (MD5 / SHA256) หากผู้ใช้เลือกเปิดใช้งาน
+			if a.verify != verifyNone {
+				j.Status = statusVerifying
+				a.safeRefreshFileList()
+				fyne.Do(func() {
+					a.currentLabel.SetText(fmt.Sprintf("กำลังตรวจสอบ Hash: %s", relPath))
+				})
+
+				vErr := a.verifyHash(j.SrcPath, finalDstPath)
+				if vErr != nil {
+					j.Status = statusVerifyFailed
+					j.Err = vErr
+				} else {
+					j.Status = statusDone
+					doneBytes += copiedInFile
+					doneCount++
+				}
+			} else {
+				j.Status = statusDone
+				doneBytes += copiedInFile
+				doneCount++
+			}
 		}
 
 		a.safeRefreshFileList()
@@ -688,6 +757,69 @@ func (a *app_) safeRefreshFileList() {
 			a.fileList.Refresh()
 		}
 	})
+}
+
+// verifyHash คำนวณและเปรียบเทียบ Hash ระหว่างต้นทางและปลายทาง
+func (a *app_) verifyHash(src, dst string) error {
+	srcHash, err := a.computeFileHash(src)
+	if err != nil {
+		return fmt.Errorf("คำนวณ Hash ต้นทางล้มเหลว: %w", err)
+	}
+
+	dstHash, err := a.computeFileHash(dst)
+	if err != nil {
+		return fmt.Errorf("คำนวณ Hash ปลายทางล้มเหลว: %w", err)
+	}
+
+	if srcHash != dstHash {
+		return fmt.Errorf("Checksum ไม่ตรงกัน! (ต้นทาง: %s..., ปลายทาง: %s...)",
+			truncateHash(srcHash), truncateHash(dstHash))
+	}
+
+	return nil
+}
+
+func (a *app_) computeFileHash(filePath string) (string, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	var h hash.Hash
+	if a.verify == verifySHA256 {
+		h = sha256.New()
+	} else {
+		h = md5.New()
+	}
+
+	buf := make([]byte, copyBufSize)
+	for {
+		if a.ctrl.waitIfPaused() || a.ctrl.isCancelled() {
+			return "", errCancelled
+		}
+		n, rerr := f.Read(buf)
+		if n > 0 {
+			if _, werr := h.Write(buf[:n]); werr != nil {
+				return "", werr
+			}
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return "", rerr
+		}
+	}
+
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func truncateHash(h string) string {
+	if len(h) > 8 {
+		return h[:8]
+	}
+	return h
 }
 
 // เก็บ import storage ไว้เผื่อขยายการรองรับ URI แบบอื่นในอนาคต
