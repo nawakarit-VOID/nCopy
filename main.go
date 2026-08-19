@@ -523,7 +523,7 @@ func (a *app_) runCopy() {
 			continue
 		}
 
-		finalDstPath, action := a.resolveDestination(destPath, j.RelPath)
+		finalDstPath, action := a.resolveDestination(j.SrcPath, destPath, j.RelPath)
 		if action == "skip" {
 			j.Status = statusSkipped
 			a.safeRefreshFileList()
@@ -700,8 +700,9 @@ func (a *app_) copyOneFile(src, dst string, size int64, onProgress func(copied i
 
 // resolveDestination ตรวจสอบไฟล์ซ้ำตามนโยบาย (policy) ที่เลือก
 // คืนค่า (path ปลายทางที่จะใช้, แอคชัน "copy" หรือ "skip")
-func (a *app_) resolveDestination(destPath, relPath string) (string, string) {
-	if _, err := os.Stat(destPath); os.IsNotExist(err) {
+func (a *app_) resolveDestination(srcPath, destPath, relPath string) (string, string) {
+	dstInfo, err := os.Stat(destPath)
+	if os.IsNotExist(err) {
 		return destPath, "copy"
 	}
 
@@ -713,41 +714,118 @@ func (a *app_) resolveDestination(destPath, relPath string) (string, string) {
 		return destPath, "skip"
 
 	case overwriteRename:
-		ext := filepath.Ext(destPath)
-		base := strings.TrimSuffix(destPath, ext)
-		counter := 1
-		for {
-			newName := fmt.Sprintf("%s (%d)%s", base, counter, ext)
-			if _, err := os.Stat(newName); os.IsNotExist(err) {
-				return newName, "copy"
-			}
-			counter++
-		}
+		return generateUniqueName(destPath), "copy"
 
 	case overwriteAsk:
-		ch := make(chan string)
+		srcInfo, sErr := os.Stat(srcPath)
+
+		srcSizeStr, srcTimeStr := "ไม่ทราบ", "ไม่ทราบ"
+		if sErr == nil {
+			srcSizeStr = humanSize(srcInfo.Size())
+			srcTimeStr = srcInfo.ModTime().Format("2006-01-02 15:04:05")
+		}
+
+		dstSizeStr, dstTimeStr := "ไม่ทราบ", "ไม่ทราบ"
+		if err == nil {
+			dstSizeStr = humanSize(dstInfo.Size())
+			dstTimeStr = dstInfo.ModTime().Format("2006-01-02 15:04:05")
+		}
+
+		type result struct {
+			action     string
+			targetPath string
+			applyAll   bool
+			chosenPolicy overwritePolicy
+		}
+		ch := make(chan result)
+
 		fyne.Do(func() {
-			d := dialog.NewConfirm(
-				"พบไฟล์ซ้ำ",
-				fmt.Sprintf("ไฟล์ปลายทาง %s มีอยู่แล้ว\nคุณต้องการเขียนทับหรือไม่?", relPath),
-				func(overwrite bool) {
-					if overwrite {
-						ch <- "copy"
-					} else {
-						ch <- "skip"
-					}
-				},
-				a.win,
+			msgLabel := widget.NewLabel(fmt.Sprintf("พบไฟล์ปลายทางที่มีชื่อซ้ำกัน:\n%s", relPath))
+			msgLabel.TextStyle = fyne.TextStyle{Bold: true}
+
+			srcBox := container.NewVBox(
+				widget.NewLabelWithStyle("ต้นทาง (Source)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+				widget.NewLabel(fmt.Sprintf("ขนาด: %s", srcSizeStr)),
+				widget.NewLabel(fmt.Sprintf("แก้ไขล่าสุด: %s", srcTimeStr)),
 			)
-			d.SetConfirmText("เขียนทับ (Overwrite)")
-			d.SetDismissText("ข้ามไฟล์นี้ (Skip)")
+
+			dstBox := container.NewVBox(
+				widget.NewLabelWithStyle("ปลายทางเดิม (Destination)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+				widget.NewLabel(fmt.Sprintf("ขนาด: %s", dstSizeStr)),
+				widget.NewLabel(fmt.Sprintf("แก้ไขล่าสุด: %s", dstTimeStr)),
+			)
+
+			comparisonContainer := container.NewGridWithColumns(2, srcBox, dstBox)
+			applyAllCheck := widget.NewCheck("นำตัวเลือกนี้ไปใช้กับไฟล์ซ้ำที่เหลือทั้งหมดในรอบนี้ (Apply to all)", nil)
+
+			var d dialog.Dialog
+			
+			btnOverwrite := widget.NewButton("เขียนทับ (Overwrite)", func() {
+				d.Hide()
+				ch <- result{
+					action:       "copy",
+					targetPath:   destPath,
+					applyAll:     applyAllCheck.Checked,
+					chosenPolicy: overwriteAlways,
+				}
+			})
+			btnOverwrite.Importance = widget.HighImportance
+
+			btnRename := widget.NewButton("เปลี่ยนชื่ออัตโนมัติ (Rename)", func() {
+				d.Hide()
+				ch <- result{
+					action:       "copy",
+					targetPath:   generateUniqueName(destPath),
+					applyAll:     applyAllCheck.Checked,
+					chosenPolicy: overwriteRename,
+				}
+			})
+
+			btnSkip := widget.NewButton("ข้ามไฟล์นี้ (Skip)", func() {
+				d.Hide()
+				ch <- result{
+					action:       "skip",
+					targetPath:   destPath,
+					applyAll:     applyAllCheck.Checked,
+					chosenPolicy: overwriteSkip,
+				}
+			})
+
+			btnBox := container.NewHBox(btnOverwrite, btnRename, btnSkip)
+			content := container.NewVBox(
+				msgLabel,
+				widget.NewSeparator(),
+				comparisonContainer,
+				widget.NewSeparator(),
+				applyAllCheck,
+				btnBox,
+			)
+
+			d = dialog.NewCustomWithoutButtons("พบไฟล์ซ้ำในปลายทาง (File Conflict)", content, a.win)
 			d.Show()
 		})
-		action := <-ch
-		return destPath, action
+
+		res := <-ch
+		if res.applyAll {
+			a.policy = res.chosenPolicy
+		}
+		return res.targetPath, res.action
 	}
 
 	return destPath, "copy"
+}
+
+func generateUniqueName(destPath string) string {
+	ext := filepath.Ext(destPath)
+	base := strings.TrimSuffix(destPath, ext)
+	counter := 1
+	for {
+		newName := fmt.Sprintf("%s (%d)%s", base, counter, ext)
+		if _, err := os.Stat(newName); os.IsNotExist(err) {
+			return newName
+		}
+		counter++
+	}
 }
 
 // safeRefreshFileList รีเฟรช list widget (เรียกจาก goroutine พื้นหลัง)
