@@ -108,6 +108,29 @@ func (v verifyMode) String() string {
 	return ""
 }
 
+type queueSortOrder int
+
+const (
+	sortNameAsc queueSortOrder = iota
+	sortNameDesc
+	sortSizeAsc
+	sortSizeDesc
+)
+
+func (q queueSortOrder) String() string {
+	switch q {
+	case sortNameAsc:
+		return "เรียงตามชื่อ (A-Z)"
+	case sortNameDesc:
+		return "เรียงตามชื่อ (Z-A)"
+	case sortSizeAsc:
+		return "เรียงตามขนาด (เล็ก -> ใหญ่)"
+	case sortSizeDesc:
+		return "เรียงตามขนาด (ใหญ่ -> เล็ก)"
+	}
+	return ""
+}
+
 // ---------- ตัวควบคุมการทำงาน (pause/resume/cancel) ----------
 
 type controller struct {
@@ -172,6 +195,7 @@ type app_ struct {
 	destDir          string
 	policy           overwritePolicy
 	verify           verifyMode
+	sortOrder        queueSortOrder
 	preserveMetadata bool
 
 	jobs []*copyJob
@@ -317,6 +341,29 @@ func (a *app_) buildUI() fyne.CanvasObject {
 	})
 	verifySelect.SetSelected(verifyNone.String())
 
+	sortSelect := widget.NewSelect([]string{
+		sortNameAsc.String(),
+		sortNameDesc.String(),
+		sortSizeAsc.String(),
+		sortSizeDesc.String(),
+	}, func(selected string) {
+		switch selected {
+		case sortNameAsc.String():
+			a.sortOrder = sortNameAsc
+		case sortNameDesc.String():
+			a.sortOrder = sortNameDesc
+		case sortSizeAsc.String():
+			a.sortOrder = sortSizeAsc
+		case sortSizeDesc.String():
+			a.sortOrder = sortSizeDesc
+		}
+		if len(a.jobs) > 0 {
+			a.applySort(a.jobs)
+			a.fileList.Refresh()
+		}
+	})
+	sortSelect.SetSelected(sortNameAsc.String())
+
 	preserveCheck := widget.NewCheck("คงค่า Metadata (เวลา/สิทธิ์ไฟล์)", func(checked bool) {
 		a.preserveMetadata = checked
 	})
@@ -325,7 +372,9 @@ func (a *app_) buildUI() fyne.CanvasObject {
 	optionsRow := container.NewHBox(
 		widget.NewLabelWithStyle("กรณีไฟล์ซ้ำ:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		policySelect,
-		widget.NewLabelWithStyle("  ตรวจสอบความถูกต้อง:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		widget.NewLabelWithStyle("  เรียงคิว:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		sortSelect,
+		widget.NewLabelWithStyle("  ตรวจสอบ:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		verifySelect,
 		preserveCheck,
 	)
@@ -416,9 +465,7 @@ func (a *app_) rebuildQueue() {
 		}
 	}
 
-	sort.Slice(jobs, func(i, j int) bool {
-		return strings.ToLower(jobs[i].RelPath) < strings.ToLower(jobs[j].RelPath)
-	})
+	a.applySort(jobs)
 
 	a.jobs = jobs
 	a.fileList.Refresh()
@@ -427,6 +474,28 @@ func (a *app_) rebuildQueue() {
 		total += j.Size
 	}
 	a.updateOverall(0, len(jobs), 0, total)
+}
+
+func (a *app_) applySort(jobs []*copyJob) {
+	sort.Slice(jobs, func(i, j int) bool {
+		switch a.sortOrder {
+		case sortNameAsc:
+			return strings.ToLower(jobs[i].RelPath) < strings.ToLower(jobs[j].RelPath)
+		case sortNameDesc:
+			return strings.ToLower(jobs[i].RelPath) > strings.ToLower(jobs[j].RelPath)
+		case sortSizeAsc:
+			if jobs[i].Size == jobs[j].Size {
+				return strings.ToLower(jobs[i].RelPath) < strings.ToLower(jobs[j].RelPath)
+			}
+			return jobs[i].Size < jobs[j].Size
+		case sortSizeDesc:
+			if jobs[i].Size == jobs[j].Size {
+				return strings.ToLower(jobs[i].RelPath) < strings.ToLower(jobs[j].RelPath)
+			}
+			return jobs[i].Size > jobs[j].Size
+		}
+		return strings.ToLower(jobs[i].RelPath) < strings.ToLower(jobs[j].RelPath)
+	})
 }
 
 func (a *app_) updateOverall(doneCount, totalCount int, doneBytes, totalBytes int64) {
