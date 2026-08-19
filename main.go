@@ -169,9 +169,10 @@ type app_ struct {
 	win     fyne.Window
 
 	sources []string // ไฟล์/โฟลเดอร์ต้นฉบับที่ผู้ใช้เลือก
-	destDir string
-	policy  overwritePolicy
-	verify  verifyMode
+	destDir          string
+	policy           overwritePolicy
+	verify           verifyMode
+	preserveMetadata bool
 
 	jobs []*copyJob
 
@@ -197,7 +198,7 @@ func main() {
 	w := a.NewWindow("nCopy - คัดลอกไฟล์เรียงตามตัวอักษร")
 	w.Resize(fyne.NewSize(720, 640))
 
-	ap := &app_{fyneApp: a, win: w, ctrl: newController()}
+	ap := &app_{fyneApp: a, win: w, ctrl: newController(), preserveMetadata: true}
 
 	// รองรับ Drag & Drop ลากไฟล์/โฟลเดอร์มาวางในหน้าต่างโปรแกรม
 	w.SetOnDropped(func(pos fyne.Position, uris []fyne.URI) {
@@ -316,11 +317,17 @@ func (a *app_) buildUI() fyne.CanvasObject {
 	})
 	verifySelect.SetSelected(verifyNone.String())
 
+	preserveCheck := widget.NewCheck("คงค่า Metadata (เวลา/สิทธิ์ไฟล์)", func(checked bool) {
+		a.preserveMetadata = checked
+	})
+	preserveCheck.SetChecked(a.preserveMetadata)
+
 	optionsRow := container.NewHBox(
 		widget.NewLabelWithStyle("กรณีไฟล์ซ้ำ:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		policySelect,
 		widget.NewLabelWithStyle("  ตรวจสอบความถูกต้อง:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		verifySelect,
+		preserveCheck,
 	)
 
 	// --- รายการคิวไฟล์ ---
@@ -653,7 +660,7 @@ func (a *app_) copyOneFile(src, dst string, size int64, onProgress func(copied i
 	defer out.Close()
 
 	srcInfo, err := in.Stat()
-	if err == nil {
+	if err == nil && a.preserveMetadata {
 		// คัดลอก Permissions (Chmod)
 		_ = out.Chmod(srcInfo.Mode())
 	}
@@ -690,7 +697,7 @@ func (a *app_) copyOneFile(src, dst string, size int64, onProgress func(copied i
 	}
 
 	// คัดลอกเวลาแก้ไขล่าสุด (Modification Time / Access Time)
-	if srcInfo != nil {
+	if srcInfo != nil && a.preserveMetadata {
 		_ = out.Close() // ปิดไฟล์ก่อนตั้งเวลา
 		_ = os.Chtimes(dst, srcInfo.ModTime(), srcInfo.ModTime())
 	}
