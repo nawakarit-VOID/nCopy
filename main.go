@@ -218,6 +218,7 @@ type app_ struct {
 	overallProg  *widget.ProgressBar
 	overallLabel *widget.Label
 	speedLabel   *widget.Label
+	etaLabel     *widget.Label
 	btnStart     *widget.Button
 	btnPause     *widget.Button
 	btnCancel    *widget.Button
@@ -431,6 +432,7 @@ func (a *app_) buildUI() fyne.CanvasObject {
 	a.overallProg = widget.NewProgressBar()
 	a.overallLabel = widget.NewLabel("0 / 0 ไฟล์  (0 B / 0 B)")
 	a.speedLabel = widget.NewLabel("")
+	a.etaLabel = widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 
 	a.btnStart = widget.NewButtonWithIcon("เริ่มคัดลอก", nil, a.onStart)
 	a.btnPause = widget.NewButtonWithIcon("หยุดชั่วคราว", nil, a.onPauseResume)
@@ -445,7 +447,7 @@ func (a *app_) buildUI() fyne.CanvasObject {
 		a.fileProgress,
 		a.overallLabel,
 		a.overallProg,
-		a.speedLabel,
+		container.NewHBox(a.speedLabel, widget.NewLabel("  "), a.etaLabel),
 		controlRow,
 	)
 
@@ -549,6 +551,20 @@ func humanSize(n int64) string {
 	return fmt.Sprintf("%.1f %s", f, units[i])
 }
 
+// formatDuration แปลง seconds เป็น HH:MM:SS หรือ MM:SS
+func formatDuration(sec int) string {
+	if sec < 0 {
+		sec = 0
+	}
+	h := sec / 3600
+	m := (sec % 3600) / 60
+	s := sec % 60
+	if h > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", h, m, s)
+	}
+	return fmt.Sprintf("%d:%02d", m, s)
+}
+
 // ---------- การเริ่มคัดลอก ----------
 
 func (a *app_) onStart() {
@@ -607,6 +623,13 @@ func (a *app_) runCopy() {
 
 	// รีเซ็ต error log ของรอบนี้
 	a.errorLog = nil
+	sessionStart := time.Now()
+
+	// รีเซ็ต ETA label
+	fyne.Do(func() {
+		a.etaLabel.SetText("")
+		a.speedLabel.SetText("")
+	})
 
 	doneCount := 0
 	for idx, j := range a.jobs {
@@ -639,9 +662,9 @@ func (a *app_) runCopy() {
 			continue
 		}
 
-		lastTime := time.Now()
+		lastChunkTime := time.Now()
 		lastCopied := int64(0)
-		var currentSpeed float64
+		var currentSpeed float64 // EMA speed ต่อ chunk (B/s)
 
 		progressFn := func(copied int64) {
 			if j.Size > 0 {
@@ -652,7 +675,7 @@ func (a *app_) runCopy() {
 			}
 
 			now := time.Now()
-			elapsed := now.Sub(lastTime).Seconds()
+			elapsed := now.Sub(lastChunkTime).Seconds()
 			if elapsed >= 0.4 {
 				bytesDiff := copied - lastCopied
 				instSpeed := float64(bytesDiff) / elapsed
@@ -662,23 +685,37 @@ func (a *app_) runCopy() {
 					alpha := 0.3
 					currentSpeed = alpha*instSpeed + (1-alpha)*currentSpeed
 				}
-				remBytes := totalBytes - (doneBytes + copied)
+
+				// --- ETA คำนวณจาก global session speed (แม่นกว่า per-file) ---
+				sessionElapsed := now.Sub(sessionStart).Seconds()
+				totalDone := doneBytes + copied
 				var etaStr string
-				if currentSpeed > 0 && remBytes > 0 {
-					remSec := int(float64(remBytes) / currentSpeed)
-					if remSec < 60 {
-						etaStr = fmt.Sprintf(" (เหลือ ~%d วินาที)", remSec)
-					} else if remSec < 3600 {
-						etaStr = fmt.Sprintf(" (เหลือ ~%d นาที %d วินาที)", remSec/60, remSec%60)
-					} else {
-						etaStr = fmt.Sprintf(" (เหลือ ~%d ชม. %d นาที)", remSec/3600, (remSec%3600)/60)
+				if sessionElapsed > 1 && totalDone > 0 {
+					sessionSpeed := float64(totalDone) / sessionElapsed // B/s เฉลี่ยทั้ง session
+					remBytes := totalBytes - totalDone
+					if remBytes > 0 && sessionSpeed > 0 {
+						remSec := int(float64(remBytes) / sessionSpeed)
+						etaStr = formatDuration(remSec)
+					} else if remBytes <= 0 {
+						etaStr = "เสร็จแล้ว"
 					}
 				}
-				speedStr := fmt.Sprintf("ความเร็ว: %s/วินาที%s", humanSize(int64(currentSpeed)), etaStr)
+
+				// elapsed time ของ session
+				elapsedStr := formatDuration(int(sessionElapsed))
+
+				speedStr := fmt.Sprintf("ความเร็ว: %s/วินาที", humanSize(int64(currentSpeed)))
+				etaDisplay := ""
+				if etaStr != "" {
+					etaDisplay = fmt.Sprintf("⏱ ผ่านมา %s  |  เหลือ ~%s", elapsedStr, etaStr)
+				} else {
+					etaDisplay = fmt.Sprintf("⏱ ผ่านมา %s", elapsedStr)
+				}
 				fyne.Do(func() {
 					a.speedLabel.SetText(speedStr)
+					a.etaLabel.SetText(etaDisplay)
 				})
-				lastTime = now
+				lastChunkTime = now
 				lastCopied = copied
 			}
 			a.updateOverall(doneCount, len(a.jobs), doneBytes+copied, totalBytes)
