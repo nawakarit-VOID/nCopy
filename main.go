@@ -31,6 +31,7 @@ const (
 	statusWaiting jobStatus = iota
 	statusCopying
 	statusVerifying
+	statusRetrying
 	statusDone
 	statusSkipped
 	statusError
@@ -38,11 +39,12 @@ const (
 )
 
 type copyJob struct {
-	SrcPath string // path ต้นฉบับเต็ม
-	RelPath string // path สัมพัทธ์ (ไว้สร้างโครงสร้างโฟลเดอร์ปลายทาง)
-	Size    int64
-	Status  jobStatus
-	Err     error
+	SrcPath  string // path ต้นฉบับเต็ม
+	RelPath  string // path สัมพัทธ์ (ไว้สร้างโครงสร้างโฟลเดอร์ปลายทาง)
+	Size     int64
+	Status   jobStatus
+	Err      error
+	Retries  int // จำนวนครั้งที่ Retry แล้ว
 }
 
 func (j jobStatus) String() string {
@@ -53,6 +55,8 @@ func (j jobStatus) String() string {
 		return "กำลังคัดลอก"
 	case statusVerifying:
 		return "กำลังตรวจ Hash"
+	case statusRetrying:
+		return "กำลัง Retry..."
 	case statusDone:
 		return "เสร็จแล้ว"
 	case statusSkipped:
@@ -197,8 +201,10 @@ type app_ struct {
 	verify           verifyMode
 	sortOrder        queueSortOrder
 	preserveMetadata bool
+	maxRetry         int // จำนวนครั้ง Retry สูงสุด (0 = ไม่ retry)
 
-	jobs []*copyJob
+	errorLog []string   // สะสม error ตลอด session
+	jobs     []*copyJob
 
 	ctrl    *controller
 	running bool
@@ -222,7 +228,7 @@ func main() {
 	w := a.NewWindow("nCopy - คัดลอกไฟล์เรียงตามตัวอักษร")
 	w.Resize(fyne.NewSize(720, 640))
 
-	ap := &app_{fyneApp: a, win: w, ctrl: newController(), preserveMetadata: true}
+	ap := &app_{fyneApp: a, win: w, ctrl: newController(), preserveMetadata: true, maxRetry: 3}
 
 	// รองรับ Drag & Drop ลากไฟล์/โฟลเดอร์มาวางในหน้าต่างโปรแกรม
 	w.SetOnDropped(func(pos fyne.Position, uris []fyne.URI) {
@@ -369,6 +375,22 @@ func (a *app_) buildUI() fyne.CanvasObject {
 	})
 	preserveCheck.SetChecked(a.preserveMetadata)
 
+	retrySelect := widget.NewSelect([]string{"ไม่ Retry (0)", "1 ครั้ง", "3 ครั้ง", "5 ครั้ง", "10 ครั้ง"}, func(selected string) {
+		switch selected {
+		case "ไม่ Retry (0)":
+			a.maxRetry = 0
+		case "1 ครั้ง":
+			a.maxRetry = 1
+		case "3 ครั้ง":
+			a.maxRetry = 3
+		case "5 ครั้ง":
+			a.maxRetry = 5
+		case "10 ครั้ง":
+			a.maxRetry = 10
+		}
+	})
+	retrySelect.SetSelected("3 ครั้ง")
+
 	optionsRow := container.NewHBox(
 		widget.NewLabelWithStyle("กรณีไฟล์ซ้ำ:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		policySelect,
@@ -377,6 +399,11 @@ func (a *app_) buildUI() fyne.CanvasObject {
 		widget.NewLabelWithStyle("  ตรวจสอบ:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		verifySelect,
 		preserveCheck,
+	)
+
+	retryRow := container.NewHBox(
+		widget.NewLabelWithStyle("Retry เมื่อเกิด Error:", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		retrySelect,
 	)
 
 	// --- รายการคิวไฟล์ ---
@@ -430,6 +457,7 @@ func (a *app_) buildUI() fyne.CanvasObject {
 		widget.NewLabelWithStyle("ปลายทาง", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 		destRow,
 		optionsRow,
+		retryRow,
 		widget.NewSeparator(),
 		widget.NewLabelWithStyle("คิวไฟล์ (เรียงตามตัวอักษร)", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
 	)
@@ -570,12 +598,15 @@ func (a *app_) onCancel() {
 	a.ctrl.cancel()
 }
 
-// runCopy คัดลอกไฟล์ทีละไฟล์ตามลำดับใน a.jobs (ซึ่งเรียงตามตัวอักษรแล้ว)
+// runCopy คัดลอกไฟล์ทีละไฟล์ตามลำดับใน a.jobs พร้อม Auto-Retry และ Error Log
 func (a *app_) runCopy() {
 	var totalBytes, doneBytes int64
 	for _, j := range a.jobs {
 		totalBytes += j.Size
 	}
+
+	// รีเซ็ต error log ของรอบนี้
+	a.errorLog = nil
 
 	doneCount := 0
 	for idx, j := range a.jobs {
@@ -585,6 +616,7 @@ func (a *app_) runCopy() {
 		}
 
 		j.Status = statusCopying
+		j.Retries = 0
 		a.safeRefreshFileList()
 		relPath := j.RelPath
 		fyne.Do(func() {
@@ -596,6 +628,7 @@ func (a *app_) runCopy() {
 		if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
 			j.Status = statusError
 			j.Err = err
+			a.errorLog = append(a.errorLog, fmt.Sprintf("[Error] %s\n  → %s", relPath, err.Error()))
 			continue
 		}
 
@@ -608,9 +641,9 @@ func (a *app_) runCopy() {
 
 		lastTime := time.Now()
 		lastCopied := int64(0)
-		var currentSpeed float64 // smoothed speed (EMA)
+		var currentSpeed float64
 
-		copiedInFile, err := a.copyOneFile(j.SrcPath, finalDstPath, j.Size, func(copied int64) {
+		progressFn := func(copied int64) {
 			if j.Size > 0 {
 				val := float64(copied) / float64(j.Size)
 				fyne.Do(func() {
@@ -620,19 +653,15 @@ func (a *app_) runCopy() {
 
 			now := time.Now()
 			elapsed := now.Sub(lastTime).Seconds()
-			if elapsed >= 0.4 { // อัปเดตทุก 0.4 วินาที
+			if elapsed >= 0.4 {
 				bytesDiff := copied - lastCopied
 				instSpeed := float64(bytesDiff) / elapsed
-
-				// ใช้ Exponential Moving Average (EMA) เพื่อความนุ่มนวลและแม่นยำ
 				if currentSpeed == 0 {
 					currentSpeed = instSpeed
 				} else {
-					alpha := 0.3 // น้ำหนักของความเร็วปัจจุบัน
+					alpha := 0.3
 					currentSpeed = alpha*instSpeed + (1-alpha)*currentSpeed
 				}
-
-				// คำนวณเวลาที่เหลือโดยประมาณ (ETA)
 				remBytes := totalBytes - (doneBytes + copied)
 				var etaStr string
 				if currentSpeed > 0 && remBytes > 0 {
@@ -645,7 +674,6 @@ func (a *app_) runCopy() {
 						etaStr = fmt.Sprintf(" (เหลือ ~%d ชม. %d นาที)", remSec/3600, (remSec%3600)/60)
 					}
 				}
-
 				speedStr := fmt.Sprintf("ความเร็ว: %s/วินาที%s", humanSize(int64(currentSpeed)), etaStr)
 				fyne.Do(func() {
 					a.speedLabel.SetText(speedStr)
@@ -654,28 +682,64 @@ func (a *app_) runCopy() {
 				lastCopied = copied
 			}
 			a.updateOverall(doneCount, len(a.jobs), doneBytes+copied, totalBytes)
-		})
+		}
 
-		if err != nil {
-			if err == errCancelled {
+		// ---------- Auto-Retry Loop ----------
+		var copiedInFile int64
+		var copyErr error
+		for attempt := 0; ; attempt++ {
+			if attempt > 0 {
+				// รอ 1 วินาทีก่อน retry เพื่อให้ lock ไฟล์คลาย
+				time.Sleep(time.Second)
+				if a.ctrl.isCancelled() {
+					copyErr = errCancelled
+					break
+				}
+				j.Status = statusRetrying
+				attemptNum := attempt
+				fyne.Do(func() {
+					a.currentLabel.SetText(fmt.Sprintf("Retry (%d/%d): %s", attemptNum, a.maxRetry, relPath))
+					a.fileProgress.SetValue(0)
+				})
+				a.safeRefreshFileList()
+			}
+
+			copiedInFile, copyErr = a.copyOneFile(j.SrcPath, finalDstPath, j.Size, progressFn)
+
+			if copyErr == nil || copyErr == errCancelled {
+				break // สำเร็จ หรือถูกยกเลิก ออกจาก retry loop
+			}
+
+			j.Retries = attempt + 1
+			if attempt >= a.maxRetry {
+				break // หมดจำนวน retry แล้ว
+			}
+		}
+		// ----------------------------------
+
+		if copyErr != nil {
+			if copyErr == errCancelled {
 				j.Status = statusSkipped
 			} else {
 				j.Status = statusError
-				j.Err = err
+				j.Err = copyErr
+				errMsg := fmt.Sprintf("[Error] %s (retry %d/%d)\n  → %s",
+					relPath, j.Retries, a.maxRetry, copyErr.Error())
+				a.errorLog = append(a.errorLog, errMsg)
 			}
 		} else {
-			// ตรวจสอบ Checksum / Hash (MD5 / SHA256) หากผู้ใช้เลือกเปิดใช้งาน
+			// ตรวจสอบ Hash หากเปิดใช้งาน
 			if a.verify != verifyNone {
 				j.Status = statusVerifying
 				a.safeRefreshFileList()
 				fyne.Do(func() {
 					a.currentLabel.SetText(fmt.Sprintf("กำลังตรวจสอบ Hash: %s", relPath))
 				})
-
 				vErr := a.verifyHash(j.SrcPath, finalDstPath)
 				if vErr != nil {
 					j.Status = statusVerifyFailed
 					j.Err = vErr
+					a.errorLog = append(a.errorLog, fmt.Sprintf("[VerifyFailed] %s\n  → %s", relPath, vErr.Error()))
 				} else {
 					j.Status = statusDone
 					doneBytes += copiedInFile
@@ -692,7 +756,6 @@ func (a *app_) runCopy() {
 		a.updateOverall(doneCount, len(a.jobs), doneBytes, totalBytes)
 
 		if a.ctrl.isCancelled() {
-			// ทำเครื่องหมายไฟล์ที่เหลือว่าถูกข้าม
 			for _, rest := range a.jobs[idx+1:] {
 				rest.Status = statusSkipped
 			}
@@ -702,13 +765,31 @@ func (a *app_) runCopy() {
 	}
 
 	a.running = false
+	errSnapshot := a.errorLog // snapshot ก่อนเข้า fyne.Do
+
 	fyne.Do(func() {
 		a.currentLabel.SetText("เสร็จสิ้น (หรือถูกยกเลิก)")
 		a.btnStart.Enable()
 		a.btnPause.Disable()
 		a.btnCancel.Disable()
+
+		// แสดง Error Summary หากมี error
+		if len(errSnapshot) > 0 {
+			summary := fmt.Sprintf("พบ %d ไฟล์ที่เกิดข้อผิดพลาด:\n\n", len(errSnapshot))
+			for i, e := range errSnapshot {
+				summary += fmt.Sprintf("%d. %s\n\n", i+1, e)
+			}
+			logLbl := widget.NewLabel(summary)
+			logLbl.Wrapping = fyne.TextWrapWord
+			scroll := container.NewVScroll(logLbl)
+			scroll.SetMinSize(fyne.NewSize(560, 300))
+			d := dialog.NewCustom("Error Log - สรุปไฟล์ที่ผิดพลาด", "ปิด", scroll, a.win)
+			d.Resize(fyne.NewSize(600, 400))
+			d.Show()
+		}
 	})
 }
+
 
 var errCancelled = fmt.Errorf("ยกเลิกโดยผู้ใช้")
 
